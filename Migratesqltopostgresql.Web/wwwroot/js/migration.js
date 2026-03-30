@@ -143,10 +143,6 @@ async function testConnection(type, connectionString, statusEl, connectBtn) {
     setConnStatus(statusEl, "fail", "Please enter a connection string first.");
     return false;
   }
-  if (type === "sqlserver" && !connectionString.toLowerCase().includes("{dbname}")) {
-    setConnStatus(statusEl, "fail", "Template must contain {dbname}.");
-    return false;
-  }
 
   connectBtn.disabled = true;
   setConnStatus(statusEl, "testing", "");

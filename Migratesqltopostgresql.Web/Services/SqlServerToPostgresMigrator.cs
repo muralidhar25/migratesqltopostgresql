@@ -38,9 +38,9 @@ public sealed class SqlServerToPostgresMigrator
             : postgresAdminConnection;
         var batchSize = _configuration.GetValue("Migration:BatchSize", 1000);
 
-        if (string.IsNullOrWhiteSpace(sqlTemplate) || !sqlTemplate.Contains("{dbname}", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(sqlTemplate))
         {
-            throw new InvalidOperationException("Migration:SqlServerConnectionTemplate must include {dbname}.");
+            throw new InvalidOperationException("Migration:SqlServerConnectionTemplate is required.");
         }
 
         if (string.IsNullOrWhiteSpace(pgAdmin))
@@ -48,7 +48,7 @@ public sealed class SqlServerToPostgresMigrator
             throw new InvalidOperationException("Migration:PostgresAdminConnection is required.");
         }
 
-        var sourceConnectionString = sqlTemplate.Replace("{dbname}", sourceDb.Trim(), StringComparison.OrdinalIgnoreCase);
+        var sourceConnectionString = BuildSqlServerConnectionString(sqlTemplate, sourceDb.Trim());
         var targetDbName = targetDb.Trim();
 
         progress(5, "Connecting to SQL Server...");
@@ -72,6 +72,21 @@ public sealed class SqlServerToPostgresMigrator
 
             throw;
         }
+    }
+
+    private static string BuildSqlServerConnectionString(string sqlTemplate, string sourceDb)
+    {
+        if (sqlTemplate.Contains("{dbname}", StringComparison.OrdinalIgnoreCase))
+        {
+            return sqlTemplate.Replace("{dbname}", sourceDb, StringComparison.OrdinalIgnoreCase);
+        }
+
+        var builder = new SqlConnectionStringBuilder(sqlTemplate)
+        {
+            InitialCatalog = sourceDb
+        };
+
+        return builder.ConnectionString;
     }
 
     private async Task<bool> EnsureTargetDatabaseAsync(string adminConn, string targetDb)

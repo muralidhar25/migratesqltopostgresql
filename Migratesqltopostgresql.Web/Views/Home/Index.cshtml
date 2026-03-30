@@ -47,10 +47,10 @@
             <div class="conn-format-box">
                 <p class="conn-format-label">Expected format</p>
                 <code>Server=&lt;host&gt;,&lt;port&gt;;Database=<strong>{dbname}</strong>;User Id=&lt;user&gt;;Password=&lt;password&gt;;Encrypt=True;TrustServerCertificate=True;</code>
-                <p class="conn-format-note">Azure AD (no password): use <code>Authentication=Active Directory Default;</code> instead of User Id / Password.</p>
+                <p class="conn-format-note">You can use either <code>Database={dbname}</code> template format or a fixed database (for example <code>Database=cm_auth</code>). Azure AD (no password): use <code>Authentication=Active Directory Default;</code>.</p>
             </div>
 
-            <label for="sqlServerTemplate">Your SQL Server Connection Template <span class="req">(must contain {dbname})</span></label>
+            <label for="sqlServerTemplate">Your SQL Server Connection String <span class="req">({dbname} placeholder optional)</span></label>
             <textarea id="sqlServerTemplate" rows="4"
                 placeholder="Server=cm2-0.public.e9bc597df61e.database.windows.net,3342;Database={dbname};Encrypt=True;TrustServerCertificate=True;Authentication=Active Directory Default;"></textarea>
 

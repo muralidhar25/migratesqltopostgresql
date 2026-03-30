@@ -1,0 +1,17 @@
+## .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+## IDE
+.vscode/
+
+## Local secret overrides — never commit real credentials
+appsettings.Local.json
+appsettings.Production.json
+
+## OS noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,66 @@
+﻿@{
+    ViewData["Title"] = "Migration Console";
+}
+
+<section class="migration-panel">
+    <h1>SQL Server to PostgreSQL Migration</h1>
+    <p class="subtitle">Enter source DB name and click migrate. Progress and errors are shown below.</p>
+
+    <div class="field-row">
+        <label for="dbname">Source DB Name</label>
+        <input id="dbname" type="text" placeholder="Example: SalesDB" autocomplete="off" />
+    </div>
+
+    <div class="field-row">
+        <label for="targetDbname">Target PostgreSQL DB Name (optional)</label>
+        <input id="targetDbname" type="text" placeholder="Default: same as source" autocomplete="off" />
+    </div>
+
+    <button id="migrateBtn" class="migrate-btn" type="button">Migrate</button>
+
+    <div class="progress-wrap" aria-live="polite">
+        <div class="progress-head">
+            <span>Progress</span>
+            <span id="progressText">0%</span>
+        </div>
+        <div class="progress-track">
+            <div id="progressBar" class="progress-fill"></div>
+        </div>
+        <p id="statusText" class="status-text">Idle</p>
+    </div>
+
+    <p id="errorText" class="error-text"></p>
+
+    <div id="logBox" class="log-box"></div>
+</section>
+
+<div id="connModal" class="conn-modal hidden" role="dialog" aria-modal="true" aria-labelledby="connModalTitle">
+    <div class="conn-modal-card">
+        <h2 id="connModalTitle">Connection Setup</h2>
+
+        <div id="stepSqlServer" class="conn-step">
+            <p class="conn-step-title">Step 1 of 2: SQL Server Connection Template</p>
+            <label for="sqlServerTemplate">SQL Server Connection Template (must include {dbname})</label>
+            <textarea id="sqlServerTemplate" rows="5" placeholder="Server=cm2-0.public.e9bc597df61e.database.windows.net,3342;Database={dbname};Encrypt=True;TrustServerCertificate=True;Authentication=Active Directory Default;"></textarea>
+        </div>
+
+        <div id="stepPostgres" class="conn-step hidden">
+            <p class="conn-step-title">Step 2 of 2: PostgreSQL Admin Connection</p>
+            <label for="postgresAdminConnection">PostgreSQL Admin Connection String</label>
+            <textarea id="postgresAdminConnection" rows="5" placeholder="Host=instance-e79fb3b9-f58d-4026-87f9-657442da0e61.database.azuredatabricks.net;Port=5432;Database=postgres;Username=muralidhar;Password=&lt;enter-password&gt;;Ssl Mode=Require;Trust Server Certificate=true;"></textarea>
+        </div>
+
+        <p id="connModalError" class="error-text"></p>
+
+        <div class="conn-modal-actions">
+            <button id="connCancelBtn" type="button" class="ghost-btn">Cancel</button>
+            <button id="connBackBtn" type="button" class="ghost-btn hidden">Back</button>
+            <button id="connNextBtn" type="button" class="migrate-btn">Next</button>
+            <button id="connStartBtn" type="button" class="migrate-btn hidden">Start Migration</button>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script src="~/js/migration.js" asp-append-version="true"></script>
+}

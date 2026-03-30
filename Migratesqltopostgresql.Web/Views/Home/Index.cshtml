@@ -36,27 +36,59 @@
 
 <div id="connModal" class="conn-modal hidden" role="dialog" aria-modal="true" aria-labelledby="connModalTitle">
     <div class="conn-modal-card">
-        <h2 id="connModalTitle">Connection Setup</h2>
 
+        <!-- ── STEP 1: SQL Server ──────────────────────────────────── -->
         <div id="stepSqlServer" class="conn-step">
-            <p class="conn-step-title">Step 1 of 2: SQL Server Connection Template</p>
-            <label for="sqlServerTemplate">SQL Server Connection Template (must include {dbname})</label>
-            <textarea id="sqlServerTemplate" rows="5" placeholder="Server=cm2-0.public.e9bc597df61e.database.windows.net,3342;Database={dbname};Encrypt=True;TrustServerCertificate=True;Authentication=Active Directory Default;"></textarea>
+            <div class="conn-step-header">
+                <span class="conn-step-badge">Step 1 of 2</span>
+                <h2 id="connModalTitle">SQL Server Connection</h2>
+            </div>
+
+            <div class="conn-format-box">
+                <p class="conn-format-label">Expected format</p>
+                <code>Server=&lt;host&gt;,&lt;port&gt;;Database=<strong>{dbname}</strong>;User Id=&lt;user&gt;;Password=&lt;password&gt;;Encrypt=True;TrustServerCertificate=True;</code>
+                <p class="conn-format-note">Azure AD (no password): use <code>Authentication=Active Directory Default;</code> instead of User Id / Password.</p>
+            </div>
+
+            <label for="sqlServerTemplate">Your SQL Server Connection Template <span class="req">(must contain {dbname})</span></label>
+            <textarea id="sqlServerTemplate" rows="4"
+                placeholder="Server=cm2-0.public.e9bc597df61e.database.windows.net,3342;Database={dbname};Encrypt=True;TrustServerCertificate=True;Authentication=Active Directory Default;"></textarea>
+
+            <div class="conn-test-row">
+                <button id="sqlConnectBtn" type="button" class="connect-btn">Connect &amp; Test</button>
+                <span id="sqlConnStatus" class="conn-status"></span>
+            </div>
         </div>
 
+        <!-- ── STEP 2: PostgreSQL ─────────────────────────────────── -->
         <div id="stepPostgres" class="conn-step hidden">
-            <p class="conn-step-title">Step 2 of 2: PostgreSQL Admin Connection</p>
-            <label for="postgresAdminConnection">PostgreSQL Admin Connection String</label>
-            <textarea id="postgresAdminConnection" rows="5" placeholder="Host=instance-e79fb3b9-f58d-4026-87f9-657442da0e61.database.azuredatabricks.net;Port=5432;Database=postgres;Username=muralidhar;Password=&lt;enter-password&gt;;Ssl Mode=Require;Trust Server Certificate=true;"></textarea>
+            <div class="conn-step-header">
+                <span class="conn-step-badge">Step 2 of 2</span>
+                <h2>PostgreSQL Connection</h2>
+            </div>
+
+            <div class="conn-format-box">
+                <p class="conn-format-label">Expected format</p>
+                <code>Host=&lt;host&gt;;Port=5432;Database=&lt;db&gt;;Username=&lt;user&gt;;Password=&lt;password&gt;;Ssl Mode=Require;</code>
+            </div>
+
+            <label for="postgresAdminConnection">Your PostgreSQL Admin Connection String</label>
+            <textarea id="postgresAdminConnection" rows="4"
+                placeholder="Host=your-pg-host;Port=5432;Database=postgres;Username=muralidhar;Password=your-password;Ssl Mode=Require;Trust Server Certificate=true;"></textarea>
+
+            <div class="conn-test-row">
+                <button id="pgConnectBtn" type="button" class="connect-btn">Connect &amp; Test</button>
+                <span id="pgConnStatus" class="conn-status"></span>
+            </div>
         </div>
 
         <p id="connModalError" class="error-text"></p>
 
         <div class="conn-modal-actions">
             <button id="connCancelBtn" type="button" class="ghost-btn">Cancel</button>
-            <button id="connBackBtn" type="button" class="ghost-btn hidden">Back</button>
-            <button id="connNextBtn" type="button" class="migrate-btn">Next</button>
-            <button id="connStartBtn" type="button" class="migrate-btn hidden">Start Migration</button>
+            <button id="connBackBtn" type="button" class="ghost-btn hidden">&#8592; Back</button>
+            <button id="connNextBtn" type="button" class="migrate-btn" disabled>Next &#8594;</button>
+            <button id="connStartBtn" type="button" class="migrate-btn hidden" disabled>Start Migration</button>
         </div>
     </div>
 </div>

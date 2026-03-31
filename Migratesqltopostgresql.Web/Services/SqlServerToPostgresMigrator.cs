@@ -257,7 +257,10 @@ public sealed class SqlServerToPostgresMigrator
                 .OrderBy(x => x)
                 .ToList();
 
-            // Create all schemas in one transaction
+            // Create all user schemas plus the migration metadata schema in one transaction.
+            // The migration schema holds source-object definitions and the rename rollback log.
+            // Wrap in a 42501 guard: if the user cannot create schemas the data migration
+            // still succeeds — only metadata persistence is skipped.
             await using (var tx = await targetConn.BeginTransactionAsync(IsolationLevel.ReadCommitted))
             {
                 foreach (var schema in allSchemas)
@@ -265,6 +268,20 @@ public sealed class SqlServerToPostgresMigrator
                     await using var schemaCmd = new NpgsqlCommand($"CREATE SCHEMA IF NOT EXISTS {QuoteIdent(schema)}", targetConn, tx);
                     await schemaCmd.ExecuteNonQueryAsync();
                 }
+
+                // Create the migration schema for metadata / rollback log.
+                // Silently skip if the user lacks CREATE privilege on this database.
+                try
+                {
+                    await using var migSchemaCmd = new NpgsqlCommand(
+                        "CREATE SCHEMA IF NOT EXISTS migration", targetConn, tx);
+                    await migSchemaCmd.ExecuteNonQueryAsync();
+                }
+                catch (NpgsqlException ex) when (ex.SqlState == "42501")
+                {
+                    progress(0, "Note: no permission to create 'migration' schema — source object metadata will not be stored.");
+                }
+
                 await tx.CommitAsync();
             }
 
@@ -347,13 +364,21 @@ public sealed class SqlServerToPostgresMigrator
                 progress(90, "Skipping data copy (schema-only mode)");
             }
 
-            // Persist source objects (procedures, views, functions)
-            await using (var tx = await targetConn.BeginTransactionAsync(IsolationLevel.ReadCommitted))
+            // Persist source objects (procedures, views, functions).
+            // Skip gracefully if the migration schema could not be created due to permissions.
+            try
             {
-                await PersistSourceObjectsAsync(targetConn, tx, routines, views);
-                await tx.CommitAsync();
+                await using (var tx = await targetConn.BeginTransactionAsync(IsolationLevel.ReadCommitted))
+                {
+                    await PersistSourceObjectsAsync(targetConn, tx, routines, views);
+                    await tx.CommitAsync();
+                }
+                progress(95, "Functions, procedures, and views captured for conversion.");
             }
-            progress(95, "Functions, procedures, and views captured for conversion.");
+            catch (NpgsqlException ex) when (ex.SqlState == "42501")
+            {
+                progress(0, $"Note: could not store source object metadata (permission denied) — continuing without it. Detail: {ex.Message}");
+            }
 
             // Apply converted views first (views don't depend on procs), then routines
             await ApplyConvertedObjectsAsync(targetConn, routines, views, progress);
@@ -845,7 +870,10 @@ public sealed class SqlServerToPostgresMigrator
         IReadOnlyList<SourceRoutine> routines,
         IReadOnlyList<SourceView> views)
     {
-        // Create migration schema if it doesn't exist
+        // Create migration schema if it doesn't exist.
+        // On hosted PostgreSQL (e.g. Azure Flexible Server) the app user may lack
+        // CREATE privilege even on the target database — throw so the caller can
+        // catch 42501 and skip metadata persistence without aborting the migration.
         const string createSchemaSql = "CREATE SCHEMA IF NOT EXISTS migration";
         await using (var schemaCmd = new NpgsqlCommand(createSchemaSql, targetConn, tx))
         {

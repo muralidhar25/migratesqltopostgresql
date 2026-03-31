@@ -217,7 +217,10 @@ public sealed class MigrationController : ControllerBase
                 var schema = reader.GetString(0);
                 var table = reader.GetString(1);
                 var rows = reader.GetInt64(2);
-                sqlServerTables[$"{schema}.{table}"] = (schema, rows);
+                // Normalise to lowercase so the keys match PostgreSQL identifiers,
+                // which are lowercase after snake_case renaming (or by default).
+                var key = $"{schema.ToLowerInvariant()}.{table.ToLowerInvariant()}";
+                sqlServerTables[key] = (schema, rows);
             }
         }
 
@@ -233,6 +236,7 @@ public sealed class MigrationController : ControllerBase
                     tablename
                 FROM pg_tables
                 WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+                  AND schemaname ~ '^[a-z]'
                 ORDER BY schemaname, tablename";
 
             var tableList = new List<(string schema, string table)>();
@@ -241,7 +245,9 @@ public sealed class MigrationController : ControllerBase
             {
                 while (await reader.ReadAsync())
                 {
-                    tableList.Add((reader.GetString(0), reader.GetString(1)));
+                    // Always store as lowercase so keys match the SQL Server side
+                    // (which is also lowercased) regardless of how PG stores the name.
+                    tableList.Add((reader.GetString(0).ToLowerInvariant(), reader.GetString(1).ToLowerInvariant()));
                 }
             }
 
@@ -250,6 +256,7 @@ public sealed class MigrationController : ControllerBase
             {
                 try
                 {
+                    // Quote the actual (lowercased) identifiers for the COUNT query
                     var countQuery = $"SELECT COUNT(*) FROM \"{schema}\".\"{table}\"";
                     await using var countCmd = new NpgsqlCommand(countQuery, pgConn);
                     var count = (long)(await countCmd.ExecuteScalarAsync() ?? 0L);

@@ -44,51 +44,69 @@ public sealed class SnakeCaseRenamer
             return result;
         }
 
-        // ?? 2. Create rollback log table (inside migration schema) ???????????
+        // -- 2. Create rollback log table (inside migration schema) -----------
         // Each successful rename appends its reverse ALTER so we can undo in
         // reverse order without needing CREATE DATABASE permissions.
-        job.Log("Preparing in-database rollback log...");
-        await EnsureRollbackTableAsync(targetCs);
-        await ClearRollbackLogAsync(targetCs);
-        job.Log("? Rollback log ready (migration.rename_rollback).");
-
-        // ?? 3. Rename all identifiers ????????????????????????????????????????
+        // On hosted PostgreSQL the user may lack CREATE privilege for new schemas;
+        // in that case we proceed without a rollback log and warn the user.
+        var rollbackLogAvailable = true;
         try
         {
-            await RenameColumnsAsync(targetCs, result, job);
-            await RenameConstraintsAsync(targetCs, result, job);
-            await RenameIndexesAsync(targetCs, result, job);
-            await RenameSequencesAsync(targetCs, result, job);
-            await RenameViewsAsync(targetCs, result, job);
-            await RenameFunctionsAsync(targetCs, result, job);
-            await RenameTablesAsync(targetCs, result, job);
-            await RenameSchemasAsync(targetCs, result, job);
+            job.Log("Preparing in-database rollback log...");
+            await EnsureRollbackTableAsync(targetCs);
+            await ClearRollbackLogAsync(targetCs);
+            job.Log("Rollback log ready (migration.rename_rollback).");
+        }
+        catch (NpgsqlException ex) when (ex.SqlState == "42501")
+        {
+            rollbackLogAvailable = false;
+            job.Log("Warning: no permission to create 'migration' schema - rollback log disabled. " +
+                    "Renames will still proceed but cannot be auto-reversed on failure.");
+        }
+
+        // -- 3. Rename all identifiers ----------------------------------------
+        try
+        {
+            await RenameColumnsAsync(targetCs, result, job, rollbackLogAvailable);
+            await RenameConstraintsAsync(targetCs, result, job, rollbackLogAvailable);
+            await RenameIndexesAsync(targetCs, result, job, rollbackLogAvailable);
+            await RenameSequencesAsync(targetCs, result, job, rollbackLogAvailable);
+            await RenameViewsAsync(targetCs, result, job, rollbackLogAvailable);
+            await RenameFunctionsAsync(targetCs, result, job, rollbackLogAvailable);
+            await RenameTablesAsync(targetCs, result, job, rollbackLogAvailable);
+            await RenameSchemasAsync(targetCs, result, job, rollbackLogAvailable);
 
             var total = result.SchemasRenamed + result.TablesRenamed + result.ColumnsRenamed +
                         result.IndexesRenamed + result.ConstraintsRenamed + result.SequencesRenamed +
                         result.ViewsRenamed + result.FunctionsRenamed;
 
-            job.Log($"? Rename complete — {total} identifiers renamed, {result.Skipped.Count} skipped.");
+            job.Log($"Rename complete - {total} identifiers renamed, {result.Skipped.Count} skipped.");
 
-            // Keep the rollback log in place so the user can inspect it,
-            // but mark it completed so it won't be replayed accidentally.
-            await MarkRollbackLogDoneAsync(targetCs);
+            if (rollbackLogAvailable)
+                await MarkRollbackLogDoneAsync(targetCs);
             result.Success = true;
         }
         catch (Exception ex)
         {
-            // ?? 4. Rollback via reverse-ALTER log ????????????????????????????
-            job.Log($"? Error during rename: {ex.Message}");
-            job.Log("? Rolling back completed renames using rollback log...");
-            try
+            // -- 4. Rollback via reverse-ALTER log ----------------------------
+            job.Log($"Error during rename: {ex.Message}");
+            if (rollbackLogAvailable)
             {
-                var rolled = await ExecuteRollbackLogAsync(targetCs, job);
-                job.Log($"? Rollback complete — {rolled} rename(s) reversed.");
+                job.Log("Rolling back completed renames using rollback log...");
+                try
+                {
+                    var rolled = await ExecuteRollbackLogAsync(targetCs, job);
+                    job.Log($"Rollback complete - {rolled} rename(s) reversed.");
+                }
+                catch (Exception rbEx)
+                {
+                    job.Log($"Rollback failed: {rbEx.Message}");
+                    job.Log("Review migration.rename_rollback for manual recovery SQL.");
+                }
             }
-            catch (Exception rbEx)
+            else
             {
-                job.Log($"? Rollback failed: {rbEx.Message}");
-                job.Log("?? Review migration.rename_rollback for manual recovery SQL.");
+                job.Log("Warning: rollback log was not available - renames already applied cannot be auto-reversed.");
             }
 
             result.Success = false;
@@ -103,16 +121,23 @@ public sealed class SnakeCaseRenamer
     private static async Task EnsureRollbackTableAsync(string cs)
     {
         await using var conn = await OpenAsync(cs);
-        const string sql = @"
-            CREATE SCHEMA IF NOT EXISTS migration;
+
+        // Create the schema first — must be a separate statement so we can
+        // catch 42501 permission denied independently of the table creation.
+        await using (var schemaCmd = new NpgsqlCommand("CREATE SCHEMA IF NOT EXISTS migration", conn))
+        {
+            await schemaCmd.ExecuteNonQueryAsync(); // throws 42501 if no CREATE privilege
+        }
+
+        const string tableSql = @"
             CREATE TABLE IF NOT EXISTS migration.rename_rollback (
                 seq         SERIAL PRIMARY KEY,
                 reverse_sql TEXT    NOT NULL,
                 applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 done        BOOLEAN NOT NULL DEFAULT FALSE
             );";
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        await cmd.ExecuteNonQueryAsync();
+        await using var tableCmd = new NpgsqlCommand(tableSql, conn);
+        await tableCmd.ExecuteNonQueryAsync();
     }
 
     private static async Task ClearRollbackLogAsync(string cs)
@@ -284,8 +309,8 @@ public sealed class SnakeCaseRenamer
         return count == 0;
     }
 
-    // ?? Columns ???????????????????????????????????????????????????????????????
-    private static async Task RenameColumnsAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job)
+    // -- Columns --------------------------------------------------------------
+    private static async Task RenameColumnsAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job, bool rollbackLogAvailable)
     {
         const string query = @"
             SELECT c.table_schema, c.table_name, c.column_name
@@ -315,23 +340,23 @@ public sealed class SnakeCaseRenamer
                     await ExecAsync(conn, tx, $"ALTER TABLE {Q(schema)}.{Q(table)} RENAME COLUMN {Q(column)} TO {Q(snake)}");
                     await tx.CommitAsync();
                 }, label, job);
-                // Log the reverse rename immediately after success
-                await AppendRollbackAsync(targetCs,
-                    $"ALTER TABLE {Q(schema)}.{Q(table)} RENAME COLUMN {Q(snake)} TO {Q(column)}");
+                if (rollbackLogAvailable)
+                    await AppendRollbackAsync(targetCs,
+                        $"ALTER TABLE {Q(schema)}.{Q(table)} RENAME COLUMN {Q(snake)} TO {Q(column)}");
                 result.ColumnsRenamed++;
-                result.Changes.Add($"column  {schema}.{table}.{column} ? {snake}");
-                job.Log($"  {label} ? {snake}");
+                result.Changes.Add($"column  {schema}.{table}.{column} -> {snake}");
+                job.Log($"  {label} -> {snake}");
             }
             catch (Exception ex)
             {
                 result.Skipped.Add($"column  {schema}.{table}.{column}: {ex.Message}");
-                job.Log($"  ?? skipped {label}: {ex.Message}");
+                job.Log($"  skipped {label}: {ex.Message}");
             }
         }
     }
 
-    // ?? Constraints ???????????????????????????????????????????????????????????
-    private static async Task RenameConstraintsAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job)
+    // -- Constraints ----------------------------------------------------------
+    private static async Task RenameConstraintsAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job, bool rollbackLogAvailable)
     {
         const string query = @"
             SELECT n.nspname, c.conname
@@ -373,23 +398,24 @@ public sealed class SnakeCaseRenamer
 
                 if (tableName is not null)
                 {
-                    await AppendRollbackAsync(targetCs,
-                        $"ALTER TABLE {Q(schema)}.{Q(tableName)} RENAME CONSTRAINT {Q(snake)} TO {Q(name)}");
+                    if (rollbackLogAvailable)
+                        await AppendRollbackAsync(targetCs,
+                            $"ALTER TABLE {Q(schema)}.{Q(tableName)} RENAME CONSTRAINT {Q(snake)} TO {Q(name)}");
                     result.ConstraintsRenamed++;
-                    result.Changes.Add($"constraint  {schema}.{name} ? {snake}");
-                    job.Log($"  {label} ? {snake}");
+                    result.Changes.Add($"constraint  {schema}.{name} -> {snake}");
+                    job.Log($"  {label} -> {snake}");
                 }
             }
             catch (Exception ex)
             {
                 result.Skipped.Add($"constraint  {schema}.{name}: {ex.Message}");
-                job.Log($"  ?? skipped {label}: {ex.Message}");
+                job.Log($"  skipped {label}: {ex.Message}");
             }
         }
     }
 
-    // ?? Indexes ???????????????????????????????????????????????????????????????
-    private static async Task RenameIndexesAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job)
+    // -- Indexes --------------------------------------------------------------
+    private static async Task RenameIndexesAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job, bool rollbackLogAvailable)
     {
         const string query = @"
             SELECT n.nspname, i.relname
@@ -419,22 +445,23 @@ public sealed class SnakeCaseRenamer
                     await ExecAsync(conn, tx, $"ALTER INDEX {Q(schema)}.{Q(name)} RENAME TO {Q(snake)}");
                     await tx.CommitAsync();
                 }, label, job);
-                await AppendRollbackAsync(targetCs,
-                    $"ALTER INDEX {Q(schema)}.{Q(snake)} RENAME TO {Q(name)}");
+                if (rollbackLogAvailable)
+                    await AppendRollbackAsync(targetCs,
+                        $"ALTER INDEX {Q(schema)}.{Q(snake)} RENAME TO {Q(name)}");
                 result.IndexesRenamed++;
-                result.Changes.Add($"index  {schema}.{name} ? {snake}");
-                job.Log($"  {label} ? {snake}");
+                result.Changes.Add($"index  {schema}.{name} -> {snake}");
+                job.Log($"  {label} -> {snake}");
             }
             catch (Exception ex)
             {
                 result.Skipped.Add($"index  {schema}.{name}: {ex.Message}");
-                job.Log($"  ?? skipped {label}: {ex.Message}");
+                job.Log($"  skipped {label}: {ex.Message}");
             }
         }
     }
 
-    // ?? Sequences ?????????????????????????????????????????????????????????????
-    private static async Task RenameSequencesAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job)
+    // -- Sequences ------------------------------------------------------------
+    private static async Task RenameSequencesAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job, bool rollbackLogAvailable)
     {
         const string query = @"
             SELECT sequence_schema, sequence_name
@@ -461,22 +488,23 @@ public sealed class SnakeCaseRenamer
                     await ExecAsync(conn, tx, $"ALTER SEQUENCE {Q(schema)}.{Q(name)} RENAME TO {Q(snake)}");
                     await tx.CommitAsync();
                 }, label, job);
-                await AppendRollbackAsync(targetCs,
-                    $"ALTER SEQUENCE {Q(schema)}.{Q(snake)} RENAME TO {Q(name)}");
+                if (rollbackLogAvailable)
+                    await AppendRollbackAsync(targetCs,
+                        $"ALTER SEQUENCE {Q(schema)}.{Q(snake)} RENAME TO {Q(name)}");
                 result.SequencesRenamed++;
-                result.Changes.Add($"sequence  {schema}.{name} ? {snake}");
-                job.Log($"  {label} ? {snake}");
+                result.Changes.Add($"sequence  {schema}.{name} -> {snake}");
+                job.Log($"  {label} -> {snake}");
             }
             catch (Exception ex)
             {
                 result.Skipped.Add($"sequence  {schema}.{name}: {ex.Message}");
-                job.Log($"  ?? skipped {label}: {ex.Message}");
+                job.Log($"  skipped {label}: {ex.Message}");
             }
         }
     }
 
-    // ?? Views ?????????????????????????????????????????????????????????????????
-    private static async Task RenameViewsAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job)
+    // -- Views ----------------------------------------------------------------
+    private static async Task RenameViewsAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job, bool rollbackLogAvailable)
     {
         const string query = @"
             SELECT table_schema, table_name
@@ -503,22 +531,23 @@ public sealed class SnakeCaseRenamer
                     await ExecAsync(conn, tx, $"ALTER VIEW {Q(schema)}.{Q(name)} RENAME TO {Q(snake)}");
                     await tx.CommitAsync();
                 }, label, job);
-                await AppendRollbackAsync(targetCs,
-                    $"ALTER VIEW {Q(schema)}.{Q(snake)} RENAME TO {Q(name)}");
+                if (rollbackLogAvailable)
+                    await AppendRollbackAsync(targetCs,
+                        $"ALTER VIEW {Q(schema)}.{Q(snake)} RENAME TO {Q(name)}");
                 result.ViewsRenamed++;
-                result.Changes.Add($"view  {schema}.{name} ? {snake}");
-                job.Log($"  {label} ? {snake}");
+                result.Changes.Add($"view  {schema}.{name} -> {snake}");
+                job.Log($"  {label} -> {snake}");
             }
             catch (Exception ex)
             {
                 result.Skipped.Add($"view  {schema}.{name}: {ex.Message}");
-                job.Log($"  ?? skipped {label}: {ex.Message}");
+                job.Log($"  skipped {label}: {ex.Message}");
             }
         }
     }
 
-    // ?? Functions / Procedures ????????????????????????????????????????????????
-    private static async Task RenameFunctionsAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job)
+    // -- Functions / Procedures -----------------------------------------------
+    private static async Task RenameFunctionsAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job, bool rollbackLogAvailable)
     {
         const string query = @"
             SELECT n.nspname, p.proname,
@@ -547,22 +576,23 @@ public sealed class SnakeCaseRenamer
                     await ExecAsync(conn, tx, $"ALTER FUNCTION {Q(schema)}.{Q(name)}({args}) RENAME TO {Q(snake)}");
                     await tx.CommitAsync();
                 }, label, job);
-                await AppendRollbackAsync(targetCs,
-                    $"ALTER FUNCTION {Q(schema)}.{Q(snake)}({args}) RENAME TO {Q(name)}");
+                if (rollbackLogAvailable)
+                    await AppendRollbackAsync(targetCs,
+                        $"ALTER FUNCTION {Q(schema)}.{Q(snake)}({args}) RENAME TO {Q(name)}");
                 result.FunctionsRenamed++;
-                result.Changes.Add($"function  {schema}.{name} ? {snake}");
-                job.Log($"  {label} ? {snake}");
+                result.Changes.Add($"function  {schema}.{name} -> {snake}");
+                job.Log($"  {label} -> {snake}");
             }
             catch (Exception ex)
             {
                 result.Skipped.Add($"function  {schema}.{name}: {ex.Message}");
-                job.Log($"  ?? skipped {label}: {ex.Message}");
+                job.Log($"  skipped {label}: {ex.Message}");
             }
         }
     }
 
-    // ?? Tables ????????????????????????????????????????????????????????????????
-    private static async Task RenameTablesAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job)
+    // -- Tables ---------------------------------------------------------------
+    private static async Task RenameTablesAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job, bool rollbackLogAvailable)
     {
         const string query = @"
             SELECT table_schema, table_name
@@ -590,22 +620,22 @@ public sealed class SnakeCaseRenamer
                     await ExecAsync(conn, tx, $"ALTER TABLE {Q(schema)}.{Q(name)} RENAME TO {Q(snake)}");
                     await tx.CommitAsync();
                 }, label, job);
-                await AppendRollbackAsync(targetCs,
-                    $"ALTER TABLE {Q(schema)}.{Q(snake)} RENAME TO {Q(name)}");
+                if (rollbackLogAvailable)
+                    await AppendRollbackAsync(targetCs,
+                        $"ALTER TABLE {Q(schema)}.{Q(snake)} RENAME TO {Q(name)}");
                 result.TablesRenamed++;
-                result.Changes.Add($"table  {schema}.{name} ? {snake}");
-                job.Log($"  {label} ? {snake}");
+                result.Changes.Add($"table  {schema}.{name} -> {snake}");
+                job.Log($"  {label} -> {snake}");
             }
             catch (Exception ex)
             {
                 result.Skipped.Add($"table  {schema}.{name}: {ex.Message}");
-                job.Log($"  ?? skipped {label}: {ex.Message}");
+                job.Log($"  skipped {label}: {ex.Message}");
             }
         }
     }
-
-    // ?? Schemas ???????????????????????????????????????????????????????????????
-    private static async Task RenameSchemasAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job)
+    // -- Schemas --------------------------------------------------------------
+    private static async Task RenameSchemasAsync(string targetCs, RenameToSnakeCaseResult result, RenameJob job, bool rollbackLogAvailable)
     {
         const string query = @"
             SELECT schema_name
@@ -632,16 +662,17 @@ public sealed class SnakeCaseRenamer
                     await ExecAsync(conn, tx, $"ALTER SCHEMA {Q(schema)} RENAME TO {Q(snake)}");
                     await tx.CommitAsync();
                 }, label, job);
-                await AppendRollbackAsync(targetCs,
-                    $"ALTER SCHEMA {Q(snake)} RENAME TO {Q(schema)}");
+                if (rollbackLogAvailable)
+                    await AppendRollbackAsync(targetCs,
+                        $"ALTER SCHEMA {Q(snake)} RENAME TO {Q(schema)}");
                 result.SchemasRenamed++;
-                result.Changes.Add($"schema  {schema} ? {snake}");
-                job.Log($"  {label} ? {snake}");
+                result.Changes.Add($"schema  {schema} -> {snake}");
+                job.Log($"  {label} -> {snake}");
             }
             catch (Exception ex)
             {
                 result.Skipped.Add($"schema  {schema}: {ex.Message}");
-                job.Log($"  ?? skipped {label}: {ex.Message}");
+                job.Log($"  skipped {label}: {ex.Message}");
             }
         }
     }

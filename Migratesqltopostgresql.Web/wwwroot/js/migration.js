@@ -475,3 +475,200 @@ function escapeHtml(text) {
   div.textContent = text;
   return div.innerHTML;
 }
+
+// ── snake_case rename ─────────────────────────────────────────────────────────
+const renameBtn       = document.getElementById('renameBtn');
+const renameClearBtn  = document.getElementById('renameClearBtn');
+const renameResults   = document.getElementById('renameResults');
+const renameLogBox    = document.getElementById('renameLogBox');
+
+let renamePoller   = null;
+let renameLogCount = 0;
+
+renameBtn.addEventListener('click', async () => {
+  const targetDb = targetInput.value.trim() || dbNameInput.value.trim();
+  const pgCs     = postgresAdminConnectionInput.value.trim();
+
+  if (!targetDb || !pgCs) {
+    alert('Please enter the target database name and configure the PostgreSQL connection first.');
+    return;
+  }
+
+  // Reset UI
+  renameBtn.disabled    = true;
+  renameBtn.textContent = 'Renaming…';
+  renameLogBox.textContent = '';
+  renameLogBox.classList.remove('hidden');
+  renameResults.classList.add('hidden');
+  renameResults.innerHTML = '';
+  renameClearBtn.classList.add('hidden');
+  renameLogCount = 0;
+
+  appendRenameLog('Starting rename job…');
+
+  try {
+    const res = await fetch('/api/migration/rename-to-snake-case', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetDbName: targetDb, postgresAdminConnection: pgCs })
+    });
+
+    const { jobId } = await res.json();
+    if (!jobId) throw new Error('No job ID returned.');
+
+    renamePoller = setInterval(async () => {
+      try {
+        const statusRes = await fetch(`/api/migration/rename-status/${jobId}`);
+        const data = await statusRes.json();
+
+        // Append only new log lines
+        const logs = data.logs || [];
+        for (let i = renameLogCount; i < logs.length; i++) {
+          appendRenameLog(logs[i]);
+        }
+        renameLogCount = logs.length;
+
+        if (data.done) {
+          clearInterval(renamePoller);
+          renamePoller = null;
+          renameBtn.disabled    = false;
+          renameBtn.textContent = 'Rename to snake_case';
+          renameClearBtn.classList.remove('hidden');
+
+          if (data.result) {
+            renderRenameResults(data.result);
+          } else if (data.error) {
+            renameResults.innerHTML = `<p class="error">❌ Error: ${escapeHtml(data.error)}</p>`;
+            renameResults.classList.remove('hidden');
+          }
+        }
+      } catch (pollErr) {
+        clearInterval(renamePoller);
+        renamePoller = null;
+        renameBtn.disabled    = false;
+        renameBtn.textContent = 'Rename to snake_case';
+        appendRenameLog(`❌ Polling error: ${pollErr.message}`);
+      }
+    }, 800);
+
+  } catch (err) {
+    renameBtn.disabled    = false;
+    renameBtn.textContent = 'Rename to snake_case';
+    appendRenameLog(`❌ Failed to start: ${err.message}`);
+  }
+});
+
+function appendRenameLog(line) {
+  const el = document.createElement('div');
+  el.textContent = line;
+  renameLogBox.appendChild(el);
+  renameLogBox.scrollTop = renameLogBox.scrollHeight;
+}
+
+renameClearBtn.addEventListener('click', () => {
+  renameResults.innerHTML = '';
+  renameResults.classList.add('hidden');
+  renameLogBox.textContent = '';
+  renameLogBox.classList.add('hidden');
+  renameClearBtn.classList.add('hidden');
+});
+
+function renderRenameResults(d) {
+  const total = d.schemasRenamed + d.tablesRenamed + d.columnsRenamed +
+                d.indexesRenamed + d.constraintsRenamed + d.sequencesRenamed +
+                d.viewsRenamed + d.functionsRenamed;
+
+  const stat = (label, val) => `
+    <div class="rename-stat">
+      <div class="rename-stat-label">${label}</div>
+      <div class="rename-stat-value ${val > 0 ? 'has-changes' : ''}">${val}</div>
+    </div>`;
+
+  const changesList = d.changes && d.changes.length > 0
+    ? `<div class="rename-changes">
+         <h4>✅ Renamed (${d.changes.length})</h4>
+         <ul class="rename-list changes">
+           ${d.changes.map(c => `<li>${escapeHtml(c)}</li>`).join('')}
+         </ul>
+       </div>`
+    : '';
+
+  const skippedList = d.skipped && d.skipped.length > 0
+    ? `<div class="rename-skipped">
+         <h4>⚠️ Skipped / needs manual fix (${d.skipped.length})</h4>
+         <ul class="rename-list skipped">
+           ${d.skipped.map(s => `<li>${escapeHtml(s)}</li>`).join('')}
+         </ul>
+       </div>`
+    : '';
+
+  renameResults.innerHTML = `
+    <div>
+      <h3 style="margin-top:0;color:var(--accent)">
+        ${total === 0 ? '✅ Already in snake_case — nothing to rename' : `✅ ${total} identifiers renamed`}
+      </h3>
+      <div class="rename-summary">
+        ${stat('Schemas', d.schemasRenamed)}
+        ${stat('Tables', d.tablesRenamed)}
+        ${stat('Columns', d.columnsRenamed)}
+        ${stat('Constraints', d.constraintsRenamed)}
+        ${stat('Indexes', d.indexesRenamed)}
+        ${stat('Sequences', d.sequencesRenamed)}
+        ${stat('Views', d.viewsRenamed)}
+        ${stat('Functions', d.functionsRenamed)}
+      </div>
+      ${changesList}
+      ${skippedList}
+    </div>`;
+  renameResults.classList.remove('hidden');
+}
+
+
+function renderRenameResults(d) {
+  const total = d.schemasRenamed + d.tablesRenamed + d.columnsRenamed +
+                d.indexesRenamed + d.constraintsRenamed + d.sequencesRenamed +
+                d.viewsRenamed + d.functionsRenamed;
+
+  const stat = (label, val) => `
+    <div class="rename-stat">
+      <div class="rename-stat-label">${label}</div>
+      <div class="rename-stat-value ${val > 0 ? 'has-changes' : ''}">${val}</div>
+    </div>`;
+
+  const changesList = d.changes.length > 0
+    ? `<div class="rename-changes">
+         <h4>✅ Renamed (${d.changes.length})</h4>
+         <ul class="rename-list changes">
+           ${d.changes.map(c => `<li>${escapeHtml(c)}</li>`).join('')}
+         </ul>
+       </div>`
+    : '';
+
+  const skippedList = d.skipped.length > 0
+    ? `<div class="rename-skipped">
+         <h4>⚠️ Skipped / needs manual fix (${d.skipped.length})</h4>
+         <ul class="rename-list skipped">
+           ${d.skipped.map(s => `<li>${escapeHtml(s)}</li>`).join('')}
+         </ul>
+       </div>`
+    : '';
+
+  renameResults.innerHTML = `
+    <div>
+      <h3 style="margin-top:0;color:var(--accent)">
+        ${total === 0 ? '✅ Already in snake_case — nothing to rename' : `✅ ${total} identifiers renamed`}
+      </h3>
+      <div class="rename-summary">
+        ${stat('Schemas', d.schemasRenamed)}
+        ${stat('Tables', d.tablesRenamed)}
+        ${stat('Columns', d.columnsRenamed)}
+        ${stat('Constraints', d.constraintsRenamed)}
+        ${stat('Indexes', d.indexesRenamed)}
+        ${stat('Sequences', d.sequencesRenamed)}
+        ${stat('Views', d.viewsRenamed)}
+        ${stat('Functions', d.functionsRenamed)}
+      </div>
+      ${changesList}
+      ${skippedList}
+    </div>`;
+}

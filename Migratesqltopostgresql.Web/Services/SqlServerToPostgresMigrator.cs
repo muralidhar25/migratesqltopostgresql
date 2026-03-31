@@ -177,14 +177,21 @@ public sealed class SqlServerToPostgresMigrator
         await using var conn = new NpgsqlConnection(adminConn);
         await conn.OpenAsync();
 
-        await using (var terminate = new NpgsqlCommand(@"
-            SELECT pg_terminate_backend(pid)
-            FROM pg_stat_activity
-            WHERE datname = @name AND pid <> pg_backend_pid();
-        ", conn))
+        // pg_terminate_backend requires superuser on some hosted PostgreSQL services.
+        // Silently skip on permission denied.
+        try
         {
+            await using var terminate = new NpgsqlCommand(@"
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = @name AND pid <> pg_backend_pid();
+            ", conn);
             terminate.Parameters.AddWithValue("name", targetDb);
             await terminate.ExecuteNonQueryAsync();
+        }
+        catch (NpgsqlException ex) when (ex.SqlState == "42501")
+        {
+            // Permission denied — not superuser. Continue to DROP anyway.
         }
 
         await using var dropCmd = new NpgsqlCommand($"DROP DATABASE IF EXISTS {QuoteIdent(targetDb)}", conn);
@@ -214,7 +221,7 @@ public sealed class SqlServerToPostgresMigrator
 
         try
         {
-            // Initialize database extensions and schemas (one-time setup)
+            // Advisory lock to prevent concurrent migrations on the same database
             await using (var tx = await targetConn.BeginTransactionAsync(IsolationLevel.ReadCommitted))
             {
                 await using (var lockCmd = new NpgsqlCommand("SELECT pg_advisory_xact_lock(9172301)", targetConn, tx))
@@ -222,9 +229,18 @@ public sealed class SqlServerToPostgresMigrator
                     await lockCmd.ExecuteNonQueryAsync();
                 }
 
-                await using (var extCmd = new NpgsqlCommand("CREATE EXTENSION IF NOT EXISTS pgcrypto", targetConn, tx))
+                // pgcrypto is only needed for gen_random_uuid() on PG < 13.
+                // PG 13+ has it built-in. Try to create it but silently skip on
+                // permission denied — the migration works fine without it.
+                try
                 {
+                    await using var extCmd = new NpgsqlCommand("CREATE EXTENSION IF NOT EXISTS pgcrypto", targetConn, tx);
                     await extCmd.ExecuteNonQueryAsync();
+                }
+                catch (NpgsqlException ex) when (ex.SqlState == "42501")
+                {
+                    // Permission denied — not superuser. Safe to continue;
+                    // gen_random_uuid() is available natively in PostgreSQL 13+.
                 }
 
                 await tx.CommitAsync();
@@ -338,6 +354,10 @@ public sealed class SqlServerToPostgresMigrator
                 await tx.CommitAsync();
             }
             progress(95, "Functions, procedures, and views captured for conversion.");
+
+            // Apply converted views first (views don't depend on procs), then routines
+            await ApplyConvertedObjectsAsync(targetConn, routines, views, progress);
+
             progress(100, "Migration completed successfully.");
         }
         catch (Exception ex)
@@ -717,6 +737,108 @@ public sealed class SqlServerToPostgresMigrator
         }
     }
 
+    private static async Task ApplyConvertedObjectsAsync(
+        NpgsqlConnection targetConn,
+        IReadOnlyList<SourceRoutine> routines,
+        IReadOnlyList<SourceView> views,
+        Action<int, string> progress)
+    {
+        var applied = 0;
+        var skipped = 0;
+        var total = views.Count + routines.Count;
+
+        if (total == 0)
+        {
+            progress(97, "No views or routines to apply.");
+            return;
+        }
+
+        // Apply views first (routines may depend on views)
+        foreach (var view in views)
+        {
+            var converted = ConvertTSqlToPostgres(view.Definition);
+            if (string.IsNullOrWhiteSpace(converted))
+            {
+                skipped++;
+                continue;
+            }
+
+            try
+            {
+                // Wrap in CREATE OR REPLACE VIEW if not already present
+                var ddl = BuildViewDdl(view.Schema, view.Name, converted);
+                await using var tx = await targetConn.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+                await using var cmd = new NpgsqlCommand(ddl, targetConn, tx);
+                cmd.CommandTimeout = 60;
+                await cmd.ExecuteNonQueryAsync();
+                await tx.CommitAsync();
+                applied++;
+                progress(95, $"Applied view: {view.Schema}.{view.Name}");
+            }
+            catch (Exception ex)
+            {
+                skipped++;
+                progress(0, $"Skipped view {view.Schema}.{view.Name}: {ex.Message}");
+            }
+        }
+
+        // Apply routines (functions / stored procedures)
+        foreach (var routine in routines)
+        {
+            var isProc = routine.Type.Contains("PROCEDURE", StringComparison.OrdinalIgnoreCase);
+
+            // Use structural proc converter for stored procedures, plain converter for functions
+            var converted = isProc
+                ? ConvertProcedureToPostgres(routine.Schema, routine.Name, routine.Definition)
+                : ConvertTSqlToPostgres(routine.Definition);
+
+            if (string.IsNullOrWhiteSpace(converted))
+            {
+                skipped++;
+                continue;
+            }
+
+            try
+            {
+                await using var tx = await targetConn.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+                await using var cmd = new NpgsqlCommand(converted, targetConn, tx);
+                cmd.CommandTimeout = 60;
+                await cmd.ExecuteNonQueryAsync();
+                await tx.CommitAsync();
+                applied++;
+                progress(95, $"Applied {routine.Type.ToLowerInvariant()}: {routine.Schema}.{routine.Name}");
+            }
+            catch (Exception ex)
+            {
+                skipped++;
+                progress(0, $"Skipped {routine.Type.ToLowerInvariant()} {routine.Schema}.{routine.Name}: {ex.Message}");
+            }
+        }
+
+        progress(98, $"Objects applied: {applied}, skipped (needs manual fix): {skipped} of {total}.");
+    }
+
+    private static string BuildViewDdl(string schema, string name, string convertedDefinition)
+    {
+        // Strip any existing CREATE VIEW header from the converted definition
+        // so we can rebuild it cleanly with CREATE OR REPLACE
+        var body = convertedDefinition.Trim();
+
+        var createViewPattern = System.Text.RegularExpressions.Regex.Match(
+            body,
+            @"^CREATE\s+(OR\s+REPLACE\s+)?VIEW\s+.*?AS\s+",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+
+        if (createViewPattern.Success)
+        {
+            // Already has a CREATE VIEW — replace the header to ensure OR REPLACE + quoted name
+            body = body[createViewPattern.Length..].Trim();
+        }
+
+        return $"CREATE OR REPLACE VIEW {QuoteIdent(schema)}.{QuoteIdent(name)} AS\n{body}";
+    }
+
     private static async Task PersistSourceObjectsAsync(
         NpgsqlConnection targetConn,
         NpgsqlTransaction tx,
@@ -754,7 +876,10 @@ public sealed class SqlServerToPostgresMigrator
 
         foreach (var routine in routines)
         {
-            var convertedDef = ConvertTSqlToPostgres(routine.Definition);
+            var isProc = routine.Type.Contains("PROCEDURE", StringComparison.OrdinalIgnoreCase);
+            var convertedDef = isProc
+                ? ConvertProcedureToPostgres(routine.Schema, routine.Name, routine.Definition)
+                : ConvertTSqlToPostgres(routine.Definition);
             await using var cmd = new NpgsqlCommand(upsertSql, targetConn, tx);
             cmd.Parameters.AddWithValue("schema", routine.Schema);
             cmd.Parameters.AddWithValue("name", routine.Name);
@@ -895,9 +1020,9 @@ public sealed class SqlServerToPostgresMigrator
         foreach (var (oldValue, newValue) in replacements)
         {
             result = System.Text.RegularExpressions.Regex.Replace(
-                result, 
-                System.Text.RegularExpressions.Regex.Escape(oldValue), 
-                newValue, 
+                result,
+                System.Text.RegularExpressions.Regex.Escape(oldValue),
+                newValue,
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         }
 
@@ -912,6 +1037,142 @@ public sealed class SqlServerToPostgresMigrator
         result = System.Text.RegularExpressions.Regex.Replace(result, @"\[([^\]]+)\]", "$1");
 
         return result;
+    }
+
+    private static string ConvertProcedureToPostgres(string schema, string name, string? tsqlDefinition)
+    {
+        if (string.IsNullOrWhiteSpace(tsqlDefinition))
+            return string.Empty;
+
+        var opts = System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+                   System.Text.RegularExpressions.RegexOptions.Singleline;
+
+        // ?? 1. Strip SQL Server procedure options before AS ?????????????????
+        //   e.g. WITH RECOMPILE, WITH EXECUTE AS CALLER, WITH ENCRYPTION
+        var definition = System.Text.RegularExpressions.Regex.Replace(
+            tsqlDefinition,
+            @"\bWITH\s+(RECOMPILE|ENCRYPTION|EXECUTE\s+AS\s+\w+)(\s*,\s*(RECOMPILE|ENCRYPTION|EXECUTE\s+AS\s+\w+))*\s*(?=\bAS\b)",
+            string.Empty, opts);
+
+        // ?? 2. Extract parameter list from CREATE PROCEDURE header ??????????
+        var headerMatch = System.Text.RegularExpressions.Regex.Match(definition,
+            @"CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+[\w\.\[\]""]+\s*(?<params>.*?)\s*\bAS\b",
+            opts);
+
+        var rawParams = headerMatch.Success
+            ? headerMatch.Groups["params"].Value.Trim()
+            : string.Empty;
+
+        // ?? 3. Extract body (everything after AS [BEGIN]) ???????????????????
+        var bodyMatch = System.Text.RegularExpressions.Regex.Match(definition,
+            @"\bAS\b\s*(?:BEGIN\b)?\s*(?<body>.*?)\s*(?:\bEND\b\s*)?$", opts);
+        var body = bodyMatch.Success ? bodyMatch.Groups["body"].Value.Trim() : definition;
+
+        // ?? 4. Strip SQL Server body-level hints ????????????????????????????
+        // WITH (NOLOCK), WITH (ROWLOCK), WITH (UPDLOCK) etc. on table hints
+        body = System.Text.RegularExpressions.Regex.Replace(body,
+            @"\bWITH\s*\(\s*(?:NOLOCK|ROWLOCK|UPDLOCK|HOLDLOCK|READPAST|XLOCK|TABLOCK|TABLOCKX|READUNCOMMITTED|READCOMMITTED|REPEATABLEREAD|SERIALIZABLE)(?:\s*,\s*(?:NOLOCK|ROWLOCK|UPDLOCK|HOLDLOCK|READPAST|XLOCK|TABLOCK|TABLOCKX|READUNCOMMITTED|READCOMMITTED|REPEATABLEREAD|SERIALIZABLE))*\s*\)",
+            string.Empty, opts);
+
+        // WITH RECOMPILE / EXECUTE AS inside body
+        body = System.Text.RegularExpressions.Regex.Replace(body,
+            @"\bWITH\s+(?:RECOMPILE|ENCRYPTION|EXECUTE\s+AS\s+\w+)\b",
+            string.Empty, opts);
+
+        // ?? 5. Convert body syntax ??????????????????????????????????????????
+        body = ConvertTSqlToPostgres(body);
+
+        // DECLARE @var TYPE  ?  DECLARE var TYPE;
+        body = System.Text.RegularExpressions.Regex.Replace(body,
+            @"DECLARE\s+@(\w+)\s+([\w\(\),\s]+)",
+            m => $"DECLARE {m.Groups[1].Value} {MapSqlTypeText(m.Groups[2].Value.Trim())};", opts);
+
+        // SET @var = ...  ?  var := ...;
+        body = System.Text.RegularExpressions.Regex.Replace(body,
+            @"\bSET\s+@(\w+)\s*=",
+            m => $"{m.Groups[1].Value} :=", opts);
+
+        // remaining @param refs  ?  param
+        body = System.Text.RegularExpressions.Regex.Replace(body,
+            @"@(\w+)",
+            m => m.Groups[1].Value);
+
+        // EXEC / EXECUTE  ?  PERFORM
+        body = System.Text.RegularExpressions.Regex.Replace(body,
+            @"\bEXEC(?:UTE)?\s+", "PERFORM ", opts);
+
+        // PRINT  ?  RAISE NOTICE
+        body = System.Text.RegularExpressions.Regex.Replace(body,
+            @"\bPRINT\s+", "RAISE NOTICE ", opts);
+
+        // Strip SQL Server session-level hints
+        body = System.Text.RegularExpressions.Regex.Replace(body,
+            @"SET\s+NOCOUNT\s+ON\s*;?", string.Empty, opts);
+        body = System.Text.RegularExpressions.Regex.Replace(body,
+            @"SET\s+XACT_ABORT\s+ON\s*;?", string.Empty, opts);
+
+        // ?? 6. Convert parameter declarations to PostgreSQL style ???????????
+        var pgParams = ConvertProcParams(rawParams);
+
+        // ?? 7. Build final PostgreSQL function DDL ??????????????????????????
+        return $"""
+CREATE OR REPLACE FUNCTION {QuoteIdent(schema)}.{QuoteIdent(name)}({pgParams})
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+BEGIN
+{body}
+END;
+$$;
+""";
+    }
+
+    private static string ConvertProcParams(string rawParams)
+    {
+        if (string.IsNullOrWhiteSpace(rawParams))
+            return string.Empty;
+
+        var parts = rawParams.Split(',', StringSplitOptions.RemoveEmptyEntries);
+        var pgParts = new List<string>();
+
+        foreach (var part in parts)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(part.Trim(),
+                @"@(?<n>\w+)\s+(?<t>[\w\(\)]+)(?:\s*=\s*(?<d>.+))?",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            if (!m.Success) continue;
+
+            var pname = m.Groups["n"].Value;
+            var ptype = MapSqlTypeText(m.Groups["t"].Value.Trim());
+            var hasDefault = m.Groups["d"].Success;
+
+            pgParts.Add(hasDefault ? $"{pname} {ptype} DEFAULT NULL" : $"{pname} {ptype}");
+        }
+
+        return string.Join(", ", pgParts);
+    }
+
+    private static string MapSqlTypeText(string sqlType)
+    {
+        var t = sqlType.Trim().ToUpperInvariant();
+        if (t.StartsWith("NVARCHAR") || t.StartsWith("VARCHAR")) return t.Contains("MAX") ? "TEXT" : t.Replace("NVARCHAR", "VARCHAR");
+        if (t.StartsWith("NCHAR") || t.StartsWith("CHAR")) return t.Replace("NCHAR", "CHAR");
+        if (t is "INT" or "INTEGER") return "INTEGER";
+        if (t == "BIGINT") return "BIGINT";
+        if (t is "SMALLINT" or "TINYINT") return "SMALLINT";
+        if (t == "BIT") return "BOOLEAN";
+        if (t.StartsWith("DECIMAL") || t.StartsWith("NUMERIC")) return t;
+        if (t is "FLOAT" or "DOUBLE PRECISION") return "DOUBLE PRECISION";
+        if (t is "DATETIME" or "DATETIME2" or "SMALLDATETIME" or "DATETIMEOFFSET") return "TIMESTAMP";
+        if (t == "DATE") return "DATE";
+        if (t == "TIME") return "TIME";
+        if (t == "UNIQUEIDENTIFIER") return "UUID";
+        if (t is "MONEY" or "SMALLMONEY") return "NUMERIC(19,4)";
+        if (t is "TEXT" or "NTEXT" or "XML") return "TEXT";
+        if (t is "VARBINARY" or "IMAGE") return "BYTEA";
+        return "TEXT";
     }
 
     private static string QuoteIdent(string value) => "\"" + value.Replace("\"", "\"\"") + "\"";

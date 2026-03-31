@@ -11,11 +11,16 @@ namespace Migratesqltopostgresql.Web.Controllers;
 public sealed class MigrationController : ControllerBase
 {
     private readonly MigrationCoordinator _coordinator;
+    private readonly RenameJobCoordinator _renameCoordinator;
     private readonly IConfiguration _configuration;
 
-    public MigrationController(MigrationCoordinator coordinator, IConfiguration configuration)
+    public MigrationController(
+        MigrationCoordinator coordinator,
+        RenameJobCoordinator renameCoordinator,
+        IConfiguration configuration)
     {
         _coordinator = coordinator;
+        _renameCoordinator = renameCoordinator;
         _configuration = configuration;
     }
 
@@ -307,5 +312,34 @@ public sealed class MigrationController : ControllerBase
         }
 
         return result;
+    }
+
+    [HttpPost("rename-to-snake-case")]
+    public IActionResult RenameToSnakeCase([FromBody] RenameToSnakeCaseRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.TargetDbName))
+            return BadRequest(new { success = false, message = "Target database name is required." });
+
+        if (string.IsNullOrWhiteSpace(request.PostgresAdminConnection))
+            return BadRequest(new { success = false, message = "PostgreSQL connection string is required." });
+
+        var jobId = _renameCoordinator.Start(request.PostgresAdminConnection, request.TargetDbName);
+        return Ok(new { jobId });
+    }
+
+    [HttpGet("rename-status/{jobId}")]
+    public IActionResult RenameStatus(string jobId)
+    {
+        var job = _renameCoordinator.Get(jobId);
+        if (job is null) return NotFound(new { message = "Job not found." });
+
+        return Ok(new
+        {
+            done    = job.Done,
+            success = job.Success,
+            error   = job.Error,
+            logs    = job.GetLogs(),
+            result  = job.Done ? job.Result : null
+        });
     }
 }

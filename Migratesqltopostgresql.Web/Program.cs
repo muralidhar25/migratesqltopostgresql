@@ -4,6 +4,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllersWithViews();
 builder.Services.AddSingleton<Migratesqltopostgresql.Web.Services.SqlServerToPostgresMigrator>();
 builder.Services.AddSingleton<Migratesqltopostgresql.Web.Services.MigrationCoordinator>();
+builder.Services.AddSingleton<Migratesqltopostgresql.Web.Services.RenameJobCoordinator>();
 
 var app = builder.Build();
 

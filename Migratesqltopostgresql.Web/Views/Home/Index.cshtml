@@ -40,6 +40,27 @@
         </div>
         <div id="comparisonResults" class="comparison-results hidden"></div>
     </div>
+
+    <div class="rename-section">
+        <div class="rename-header">
+            <div class="rename-title-row">
+                <h3>Naming Convention</h3>
+                <span class="rename-badge">PostgreSQL Standard</span>
+            </div>
+            <p class="rename-desc">
+                Rename all schemas, tables, columns, indexes, constraints and sequences
+                from <code>PascalCase</code> / <code>camelCase</code> to <code>snake_case</code>
+                so identifiers work without double-quotes in PostgreSQL.
+                A full backup is created before renaming and automatically rolled back on any error.
+            </p>
+        </div>
+        <div class="rename-actions">
+            <button id="renameBtn" class="rename-btn" type="button">Rename to snake_case</button>
+            <button id="renameClearBtn" class="clear-btn hidden" type="button">Clear</button>
+        </div>
+        <div id="renameLogBox" class="log-box hidden"></div>
+        <div id="renameResults" class="rename-results hidden"></div>
+    </div>
 </section>
 
 <div id="connModal" class="conn-modal hidden" role="dialog" aria-modal="true" aria-labelledby="connModalTitle">

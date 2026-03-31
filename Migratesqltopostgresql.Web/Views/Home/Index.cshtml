@@ -32,6 +32,14 @@
     <p id="errorText" class="error-text"></p>
 
     <div id="logBox" class="log-box"></div>
+
+    <div class="comparison-section">
+        <div class="comparison-actions">
+            <button id="compareBtn" class="compare-btn" type="button">Compare Databases</button>
+            <button id="clearCompareBtn" class="clear-btn hidden" type="button">Clear Comparison</button>
+        </div>
+        <div id="comparisonResults" class="comparison-results hidden"></div>
+    </div>
 </section>
 
 <div id="connModal" class="conn-modal hidden" role="dialog" aria-modal="true" aria-labelledby="connModalTitle">
@@ -79,6 +87,26 @@
             <div class="conn-test-row">
                 <button id="pgConnectBtn" type="button" class="connect-btn">Connect &amp; Test</button>
                 <span id="pgConnStatus" class="conn-status"></span>
+            </div>
+
+            <div class="migration-mode-section">
+                <label class="migration-mode-label">Migration Mode <span class="req">(required)</span></label>
+                <div class="migration-mode-options">
+                    <label class="radio-option">
+                        <input type="radio" name="migrationMode" value="schemaAndData" id="modeSchemaAndData" checked />
+                        <div class="radio-content">
+                            <strong>Schema + Data (Full Migration)</strong>
+                            <p>Migrate table structures and all data</p>
+                        </div>
+                    </label>
+                    <label class="radio-option">
+                        <input type="radio" name="migrationMode" value="schemaOnly" id="modeSchemaOnly" />
+                        <div class="radio-content">
+                            <strong>Schema Only</strong>
+                            <p>Create table structures without copying data</p>
+                        </div>
+                    </label>
+                </div>
             </div>
         </div>
 

@@ -6,4 +6,5 @@ public sealed class MigrationStartRequest
     public string? TargetDbName { get; set; }
     public string? SqlServerConnectionTemplate { get; set; }
     public string? PostgresAdminConnection { get; set; }
+    public string MigrationMode { get; set; } = "schemaAndData"; // "schemaOnly" or "schemaAndData"
 }

@@ -28,6 +28,39 @@ let pollHandle = null;
 let sqlVerified = false;
 let pgVerified  = false;
 
+// ── localStorage helpers ──────────────────────────────────────────────────────
+function loadSavedConnections() {
+  try {
+    const sqlConn = localStorage.getItem('migration_sqlserver_conn');
+    const pgConn = localStorage.getItem('migration_postgres_conn');
+
+    if (sqlConn) {
+      sqlServerTemplateInput.value = sqlConn;
+    }
+    if (pgConn) {
+      postgresAdminConnectionInput.value = pgConn;
+    }
+  } catch (err) {
+    console.warn('Could not load saved connections:', err);
+  }
+}
+
+function saveConnections() {
+  try {
+    const sqlConn = sqlServerTemplateInput.value.trim();
+    const pgConn = postgresAdminConnectionInput.value.trim();
+
+    if (sqlConn) {
+      localStorage.setItem('migration_sqlserver_conn', sqlConn);
+    }
+    if (pgConn) {
+      localStorage.setItem('migration_postgres_conn', pgConn);
+    }
+  } catch (err) {
+    console.warn('Could not save connections:', err);
+  }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 function setProgress(value) {
   const n = Math.max(0, Math.min(100, Number(value) || 0));
@@ -96,6 +129,9 @@ function openConnModal() {
   pgVerified  = false;
   connModalError.textContent = "";
 
+  // Load saved connections from localStorage
+  loadSavedConnections();
+
   setConnStatus(sqlConnStatus, "", "");
   connNextBtn.disabled = true;
   sqlConnectBtn.disabled = false;
@@ -157,6 +193,8 @@ async function testConnection(type, connectionString, statusEl, connectBtn) {
 
     if (data.success) {
       setConnStatus(statusEl, "ok", data.message);
+      // Save successful connection to localStorage
+      saveConnections();
       return true;
     } else {
       setConnStatus(statusEl, "fail", data.message);
@@ -234,6 +272,9 @@ async function submitMigration() {
   const sqlCs    = sqlServerTemplateInput.value.trim();
   const pgCs     = postgresAdminConnectionInput.value.trim();
 
+  // Get selected migration mode
+  const migrationMode = document.querySelector('input[name="migrationMode"]:checked')?.value || 'schemaAndData';
+
   closeConnModal();
   setRunning(true);
   setProgress(0);
@@ -249,7 +290,8 @@ async function submitMigration() {
         dbName,
         targetDbName: targetDb || null,
         sqlServerConnectionTemplate: sqlCs,
-        postgresAdminConnection: pgCs
+        postgresAdminConnection: pgCs,
+        migrationMode: migrationMode
       })
     });
 
@@ -274,3 +316,162 @@ connNextBtn.addEventListener("click", () => { if (sqlVerified) goToPostgresStep(
 connBackBtn.addEventListener("click", goToSqlStep);
 connStartBtn.addEventListener("click", submitMigration);
 connModal.addEventListener("click", (e) => { if (e.target === connModal) closeConnModal(); });
+
+// ── database comparison ───────────────────────────────────────────────────────
+const compareBtn = document.getElementById("compareBtn");
+const clearCompareBtn = document.getElementById("clearCompareBtn");
+const comparisonResults = document.getElementById("comparisonResults");
+
+compareBtn.addEventListener("click", async () => {
+  const dbName = dbNameInput.value.trim();
+  const targetDb = targetInput.value.trim() || dbName;
+  const sqlCs = sqlServerTemplateInput.value.trim();
+  const pgCs = postgresAdminConnectionInput.value.trim();
+
+  if (!dbName || !sqlCs || !pgCs) {
+    alert("Please enter database names and configure connections first.");
+    return;
+  }
+
+  compareBtn.disabled = true;
+  compareBtn.textContent = "Comparing...";
+  comparisonResults.innerHTML = "<p class='loading'>Comparing databases...</p>";
+  comparisonResults.classList.remove("hidden");
+  clearCompareBtn.classList.add("hidden");
+
+  try {
+    const res = await fetch("/api/migration/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceDbName: dbName,
+        targetDbName: targetDb,
+        sqlServerConnectionTemplate: sqlCs,
+        postgresAdminConnection: pgCs
+      })
+    });
+
+    const data = await res.json();
+
+    if (data.success === false) {
+      comparisonResults.innerHTML = `<p class='error'>Error: ${data.message}</p>`;
+    } else {
+      displayComparisonResults(data);
+      clearCompareBtn.classList.remove("hidden");
+    }
+  } catch (err) {
+    comparisonResults.innerHTML = `<p class='error'>Failed to compare: ${err.message}</p>`;
+  } finally {
+    compareBtn.disabled = false;
+    compareBtn.textContent = "Compare Databases";
+  }
+});
+
+clearCompareBtn.addEventListener("click", () => {
+  comparisonResults.innerHTML = "";
+  comparisonResults.classList.add("hidden");
+  clearCompareBtn.classList.add("hidden");
+});
+
+function displayComparisonResults(data) {
+  const html = `
+    <div class="comparison-summary">
+      <h3>Database Comparison: ${escapeHtml(data.sourceDatabase)} vs ${escapeHtml(data.targetDatabase)}</h3>
+
+      <div class="summary-stats">
+        <div class="stat-card">
+          <div class="stat-label">SQL Server Tables</div>
+          <div class="stat-value">${data.sqlServerTableCount}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">PostgreSQL Tables</div>
+          <div class="stat-value">${data.postgresTableCount}</div>
+        </div>
+        <div class="stat-card ${data.missingInPostgres.length > 0 ? 'stat-warning' : ''}">
+          <div class="stat-label">Missing in PostgreSQL</div>
+          <div class="stat-value">${data.missingInPostgres.length}</div>
+        </div>
+        <div class="stat-card ${data.extraInPostgres.length > 0 ? 'stat-info' : ''}">
+          <div class="stat-label">Extra in PostgreSQL</div>
+          <div class="stat-value">${data.extraInPostgres.length}</div>
+        </div>
+      </div>
+
+      ${data.schemas.length > 0 ? `
+        <div class="schema-summary">
+          <h4>Schema Summary</h4>
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th>Schema</th>
+                <th>SQL Server Tables</th>
+                <th>PostgreSQL Tables</th>
+                <th>Match</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${data.schemas.map(s => `
+                <tr class="${s.sqlServerTables === s.postgresTables ? '' : 'mismatch'}">
+                  <td><strong>${escapeHtml(s.schemaName)}</strong></td>
+                  <td>${s.sqlServerTables}</td>
+                  <td>${s.postgresTables}</td>
+                  <td>${s.sqlServerTables === s.postgresTables ? '✓' : '✗'}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      ` : ''}
+
+      ${data.missingInPostgres.length > 0 ? `
+        <div class="missing-tables">
+          <h4>⚠️ Missing in PostgreSQL (${data.missingInPostgres.length})</h4>
+          <ul>
+            ${data.missingInPostgres.map(t => `<li>${escapeHtml(t)}</li>`).join('')}
+          </ul>
+        </div>
+      ` : ''}
+
+      ${data.extraInPostgres.length > 0 ? `
+        <div class="extra-tables">
+          <h4>ℹ️ Extra in PostgreSQL (${data.extraInPostgres.length})</h4>
+          <ul>
+            ${data.extraInPostgres.map(t => `<li>${escapeHtml(t)}</li>`).join('')}
+          </ul>
+        </div>
+      ` : ''}
+
+      <div class="table-details">
+        <h4>Row Count Comparison</h4>
+        <table class="comparison-table">
+          <thead>
+            <tr>
+              <th>Schema.Table</th>
+              <th>SQL Server Rows</th>
+              <th>PostgreSQL Rows</th>
+              <th>Match</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${data.tables.map(t => `
+              <tr class="${!t.existsInSqlServer || !t.existsInPostgres ? 'missing' : (t.rowCountMatch ? '' : 'mismatch')}">
+                <td><strong>${escapeHtml(t.schema)}.${escapeHtml(t.tableName)}</strong></td>
+                <td>${t.existsInSqlServer ? t.sqlServerRows.toLocaleString() : '❌'}</td>
+                <td>${t.existsInPostgres ? (t.postgresRows >= 0 ? t.postgresRows.toLocaleString() : 'Error') : '❌'}</td>
+                <td>${!t.existsInSqlServer || !t.existsInPostgres ? '❌' : (t.rowCountMatch ? '✓' : '✗')}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  comparisonResults.innerHTML = html;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}

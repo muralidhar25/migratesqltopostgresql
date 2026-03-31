@@ -19,7 +19,8 @@ public sealed class MigrationCoordinator
         string sourceDbName,
         string targetDbName,
         string sqlServerConnectionTemplate,
-        string postgresAdminConnection)
+        string postgresAdminConnection,
+        bool schemaOnly = false)
     {
         var id = Guid.NewGuid().ToString("N");
         var job = new MigrationJob
@@ -38,6 +39,7 @@ public sealed class MigrationCoordinator
                     targetDbName,
                     sqlServerConnectionTemplate,
                     postgresAdminConnection,
+                    schemaOnly,
                     (percent, message) =>
                 {
                     job.Update(percent, message);
